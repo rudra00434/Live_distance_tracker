@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Live Location Tracker + Free Routing (OpenLayers + OSRM)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/ol3/6.15.1/ol.css">
+  <style>
+    html,body { height:100%; margin:0; font-family:Arial, sans-serif; }
+    #map { height:100%; width:100%; }
+    #info {
+      position:absolute; top:10px; left:10px;
+      background:rgba(255,255,255,0.95); padding:10px; border-radius:8px; z-index:1000;
+      box-shadow:0 2px 8px rgba(0,0,0,0.2); font-size:13px;
+      max-width:300px;
+    }
+    #controls { margin-top:6px; display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+    button { padding:6px 8px; cursor:pointer; border:1px solid #ddd; background:#f9f9f9; border-radius:4px; }
+    button:hover { background:#e9e9e9; }
+    button:disabled { opacity:0.5; cursor:not-allowed; }
+    select { padding:6px; border:1px solid #ddd; border-radius:4px; }
+    #status { margin-top:6px; color:#666; font-size:12px; line-height:1.4; }
+    .error { color:#d32f2f; }
+    .success { color:#2e7d32; }
+    .warning { color:#f57c00; }
+    /* Move zoom buttons bottom-right */
+    .ol-zoom { right:10px; bottom:10px; left:auto !important; top:auto !important; }
+  </style>
+</head>
+<body>
+  <div id="info">
+    <div><strong>Latitude:</strong> <span id="lat">—</span></div>
+    <div><strong>Longitude:</strong> <span id="lng">—</span></div>
+    <div><strong>Accuracy:</strong> <span id="accuracy">—</span></div>
+    <div><strong>Distance:</strong> <span id="distance">—</span></div>
+    <div><strong>Duration:</strong> <span id="duration">—</span></div>
+
+    <div id="controls">
+      <label for="mode">Mode:</label>
+      <select id="mode">
+        <option value="driving">Driving</option>
+        <option value="walking">Walking</option>
+        <option value="cycling">Cycling</option>
+      </select>
+      <button id="centerBtn">Center on me</button>
+      <button id="clearBtn">Clear route</button>
+      <button id="requestLocationBtn">Request Location</button>
+      <button id="testLocationBtn" style="font-size:11px;">Test Location</button>
+    </div>
+
+    <div id="status">Loading map... Click "Request Location" to start tracking.</div>
+    <div id="debug" style="margin-top:4px; font-size:11px; color:#999;"></div>
+  </div>
+
+  <div id="map"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/ol3/6.15.1/ol.js"></script>
+  <script>
+  (function() {
+    'use strict';
+    
+    // --- variables ---
+    let map, routeLayer, markersSource, markersLayer;
+    let userFeature = null;
+    let destFeature = null;
+    let currentUserLonLat = null;
+    let watchId = null;
+    let isTracking = false;
+
+    // Check if OpenLayers is loaded
+    function checkOLLoaded() {
+      return typeof ol !== 'undefined' && 
+             ol.Map && 
+             ol.layer && 
+             ol.source && 
+             ol.proj;
+    }
+
+    // Initialize map and layers
+    function createMap() {
+      if (!checkOLLoaded()) {
+        updateStatus('Map library not loaded. Please refresh the page.', 'error');
+        return;
+      }
+
+      try {
+        markersSource = new ol.source.Vector({ features: [] });
+        markersLayer = new ol.layer.Vector({ source: markersSource });
+
+        routeLayer = new ol.layer.Vector({ source: new ol.source.Vector() });
+
+        map = new ol.Map({
+          target: 'map',
+          layers: [
+            new ol.layer.Tile({ source: new ol.source.OSM() }),
+            routeLayer,
+            markersLayer
+          ],
+          view: new ol.View({
+            center: ol.proj.fromLonLat([78.9629, 20.5937]), // India center as fallback
+            zoom: 5
+          }),
+          controls: ol.control.defaults({ attribution: false }).extend([ new ol.control.Zoom() ])
+        });
+
+        // map click sets destination
+        map.on('singleclick', function(evt) {
+          const lonlat = ol.proj.toLonLat(evt.coordinate);
+          setDestination(lonlat[0], lonlat[1]);
+        });
+
+        updateStatus('Map loaded. Click "Request Location" to start tracking.', 'success');
+      } catch (error) {
+        updateStatus('Error initializing map: ' + error.message, 'error');
+        console.error('Map initialization error:', error);
+      }
+    }
+
+    // create feature helper
+    function createPointFeature(lonlat, color, radius) {
+      color = color || 'red';
+      radius = radius || 8;
+      const feature = new ol.Feature({ 
+        geometry: new ol.geom.Point(ol.proj.fromLonLat(lonlat)) 
+      });
+      feature.setStyle(new ol.style.Style({
+        image: new ol.style.Circle({
+          radius: radius,
+          fill: new ol.style.Fill({ color: color }),
+          stroke: new ol.style.Stroke({ color: '#fff', width: 2 })
+        })
+      }));
+      return feature;
+    }
+
+    // update status message with styling
+    function updateStatus(message, type) {
+      const statusEl = document.getElementById('status');
+      if (statusEl) {
+        statusEl.textContent = message;
+        statusEl.className = type || 'info';
+      }
+    }
+
+    // add debug message
+    function addDebug(message) {
+      const debugEl = document.getElementById('debug');
+      if (debugEl) {
+        const timestamp = new Date().toLocaleTimeString();
+        debugEl.textContent = `[${timestamp}] ${message}`;
+      }
+      console.log('DEBUG:', message);
+    }
+
+    // update or create user marker
+    function updateUserMarker(lon, lat, accuracy) {
+      currentUserLonLat = [lon, lat];
+      document.getElementById('lat').textContent = lat.toFixed(6);
+      document.getElementById('lng').textContent = lon.toFixed(6);
+      document.getElementById('accuracy').textContent = accuracy ? (accuracy.toFixed(0) + 'm') : '—';
+
+      if (!userFeature) {
+        userFeature = createPointFeature([lon, lat], '#4CAF50', 10); // Green for user location
+        markersSource.addFeature(userFeature);
+        map.getView().setCenter(ol.proj.fromLonLat([lon, lat]));
+        map.getView().setZoom(16);
+        updateStatus('Location found! Click the map to set a destination.', 'success');
+      } else {
+        userFeature.getGeometry().setCoordinates(ol.proj.fromLonLat([lon, lat]));
+      }
+
+      // If we have a destination, update the route
+      if (destFeature) {
+        const destCoords = ol.proj.toLonLat(destFeature.getGeometry().getCoordinates());
+        drawRoute(currentUserLonLat, destCoords);
+      }
+    }
+
+    // set or update destination marker
+    function setDestination(lon, lat) {
+      updateStatus("Destination set — requesting route...", 'info');
+      if (!destFeature) {
+        destFeature = createPointFeature([lon, lat], '#2196F3', 8); // Blue for destination
+        markersSource.addFeature(destFeature);
+      } else {
+        destFeature.getGeometry().setCoordinates(ol.proj.fromLonLat([lon, lat]));
+      }
+
+      // request route if we have user position
+      if (currentUserLonLat) {
+        drawRoute(currentUserLonLat, [lon, lat]);
+      } else {
+        updateStatus("Please enable location tracking first.", 'warning');
+      }
+    }
+
+    // clear route and destination
+    function clearRoute() {
+      if (routeLayer) {
+        routeLayer.getSource().clear();
+      }
+      if (destFeature && markersSource) {
+        markersSource.removeFeature(destFeature);
+        destFeature = null;
+      }
+      document.getElementById('distance').textContent = '—';
+      document.getElementById('duration').textContent = '—';
+      updateStatus('Route cleared.', 'info');
+    }
+
+    // draw a route using OSRM public server with fallback to straight line
+    function drawRoute(startLonLat, endLonLat) {
+      if (!routeLayer) return;
+      
+      routeLayer.getSource().clear();
+      updateStatus('Calculating route...', 'info');
+
+      // choose profile based on mode select
+      const modeSelect = document.getElementById('mode');
+      const mode = modeSelect ? modeSelect.value : 'driving';
+
+      // Map to OSRM profile names
+      let osrmProfile;
+      if (mode === 'driving') osrmProfile = 'driving';
+      else if (mode === 'walking') osrmProfile = 'foot';
+      else if (mode === 'cycling') osrmProfile = 'bike';
+      else osrmProfile = 'driving';
+
+      const start = startLonLat[0] + ',' + startLonLat[1];
+      const end = endLonLat[0] + ',' + endLonLat[1];
+      const url = 'https://router.project-osrm.org/route/v1/' + osrmProfile + '/' + start + ';' + end + '?overview=full&geometries=geojson';
+
+      fetch(url)
+        .then(function(res) {
+          if (!res.ok) throw new Error('OSRM server responded with ' + res.status + ': ' + res.statusText);
+          return res.json();
+        })
+        .then(function(data) {
+          if (data && data.code === 'Ok' && data.routes && data.routes.length > 0) {
+            const route = data.routes[0];
+            const coords = route.geometry.coordinates.map(function(c) {
+              return ol.proj.fromLonLat(c);
+            });
+            const routeFeature = new ol.Feature({ geometry: new ol.geom.LineString(coords) });
+            routeFeature.setStyle(new ol.style.Style({
+              stroke: new ol.style.Stroke({ color: '#2196F3', width: 4, lineCap: 'round' })
+            }));
+            routeLayer.getSource().addFeature(routeFeature);
+
+            // show distance & duration from response
+            const distKm = (route.distance / 1000);
+            const durationMin = (route.duration / 60);
+            document.getElementById('distance').textContent = distKm.toFixed(2) + ' km';
+            document.getElementById('duration').textContent = durationMin.toFixed(0) + ' min';
+            updateStatus('Route found via ' + mode.toUpperCase(), 'success');
+            
+            // Fit map to show both points and route
+            const extent = routeFeature.getGeometry().getExtent();
+            map.getView().fit(extent, { padding: [50, 50, 50, 50] });
+            return;
+          } else {
+            console.warn('OSRM returned no route or error code:', data);
+            throw new Error(data.message || 'No route found');
+          }
+        })
+        .catch(function(err) {
+          console.warn('OSRM request failed:', err);
+          updateStatus('Route service unavailable, showing straight line', 'warning');
+          
+          // Fallback: draw straight line and estimate distance by haversine
+          const lineCoords = [ol.proj.fromLonLat(startLonLat), ol.proj.fromLonLat(endLonLat)];
+          const fallback = new ol.Feature({ geometry: new ol.geom.LineString(lineCoords) });
+          fallback.setStyle(new ol.style.Style({ 
+            stroke: new ol.style.Stroke({ 
+              color: '#FF9800', 
+              width: 3, 
+              lineDash: [10, 10],
+              lineCap: 'round'
+            }) 
+          }));
+          routeLayer.getSource().addFeature(fallback);
+
+          const distKm = haversineDistance(startLonLat, endLonLat);
+          const estimatedSpeed = mode === 'walking' ? 5 : mode === 'cycling' ? 15 : 50; // km/h
+          const durationMin = (distKm / estimatedSpeed) * 60;
+          document.getElementById('distance').textContent = distKm.toFixed(2) + ' km';
+          document.getElementById('duration').textContent = durationMin.toFixed(0) + ' min (est)';
+        });
+    }
+
+    // haversine distance calculation
+    function haversineDistance(a, b) {
+      const R = 6371; // Earth's radius in km
+      const dLat = (b[1]-a[1]) * Math.PI/180;
+      const dLon = (b[0]-a[0]) * Math.PI/180;
+      const lat1 = a[1]*Math.PI/180;
+      const lat2 = b[1]*Math.PI/180;
+      const x = Math.sin(dLat/2) * Math.sin(dLat/2) + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon/2) * Math.sin(dLon/2);
+      const c = 2*Math.atan2(Math.sqrt(x), Math.sqrt(1-x));
+      return R*c;
+    }
+
+    // center on user button
+    function centerOnUser() {
+      if (currentUserLonLat && map) {
+        map.getView().setCenter(ol.proj.fromLonLat(currentUserLonLat));
+        map.getView().setZoom(16);
+        updateStatus('Centered on your location', 'success');
+      } else {
+        updateStatus('Location not available. Please enable location tracking.', 'warning');
+      }
+    }
+
+    // Test location with minimal settings
+    function testLocation() {
+      addDebug('Testing basic location functionality...');
+      
+      if (!navigator.geolocation) {
+        addDebug('navigator.geolocation is not available');
+        updateStatus('Geolocation not available', 'error');
+        return;
+      }
+      
+      addDebug('navigator.geolocation exists, calling getCurrentPosition...');
+      
+      navigator.geolocation.getCurrentPosition(
+        function(position) {
+          addDebug('SUCCESS! Got coordinates: ' + position.coords.latitude + ', ' + position.coords.longitude);
+          addDebug('Accuracy: ' + position.coords.accuracy + 'm, Timestamp: ' + new Date(position.timestamp));
+          updateStatus('Location test successful!', 'success');
+          
+          // Show the location on map
+          updateUserMarker(
+            position.coords.longitude, 
+            position.coords.latitude,
+            position.coords.accuracy
+          );
+        },
+        function(error) {
+          addDebug('FAILED! Error code: ' + error.code + ', Message: ' + error.message);
+          handleGeolocationError(error);
+        },
+        {
+          enableHighAccuracy: false,
+          maximumAge: 60000,
+          timeout: 30000
+        }
+      );
+    }
+    function toggleLocationTracking() {
+      const btn = document.getElementById('requestLocationBtn');
+      
+      if (isTracking) {
+        // Stop tracking
+        if (watchId !== null) {
+          navigator.geolocation.clearWatch(watchId);
+          watchId = null;
+        }
+        isTracking = false;
+        btn.textContent = 'Request Location';
+        updateStatus('Location tracking stopped.', 'info');
+        addDebug('Tracking stopped');
+      } else {
+        // Start tracking
+        addDebug('Checking geolocation support...');
+        
+        if (!('geolocation' in navigator)) {
+          updateStatus('Geolocation is not supported by this browser.', 'error');
+          addDebug('Geolocation not supported');
+          return;
+        }
+
+        addDebug('Geolocation supported. Checking permissions...');
+        
+        // Check if we're on a secure context
+        const isSecure = location.protocol === 'https:' || 
+                        location.hostname === 'localhost' || 
+                        location.hostname === '127.0.0.1' ||
+                        location.hostname === '::1';
+        
+        if (!isSecure) {
+          updateStatus('⚠️ Location requires HTTPS or localhost. Current: ' + location.protocol, 'warning');
+          addDebug('Insecure context: ' + location.protocol + '//' + location.hostname);
+        }
+
+        updateStatus('Requesting location permission...', 'info');
+        addDebug('Requesting location permission...');
+        btn.disabled = true;
+
+        // First, try to get current position with more permissive settings
+        navigator.geolocation.getCurrentPosition(
+          function(position) {
+            addDebug('Got position: ' + position.coords.latitude + ', ' + position.coords.longitude);
+            updateUserMarker(
+              position.coords.longitude, 
+              position.coords.latitude,
+              position.coords.accuracy
+            );
+            
+            // Then start watching for changes
+            addDebug('Starting position watch...');
+            watchId = navigator.geolocation.watchPosition(
+              function(pos) {
+                addDebug('Position update: ' + pos.coords.latitude + ', ' + pos.coords.longitude);
+                updateUserMarker(
+                  pos.coords.longitude, 
+                  pos.coords.latitude,
+                  pos.coords.accuracy
+                );
+              },
+              function(error) {
+                addDebug('Watch error: ' + error.code + ' - ' + error.message);
+                handleGeolocationError(error);
+              },
+              {
+                enableHighAccuracy: false, // Try without high accuracy first
+                maximumAge: 30000, // Accept 30-second old positions
+                timeout: 30000     // 30 seconds timeout
+              }
+            );
+            
+            isTracking = true;
+            btn.textContent = 'Stop Tracking';
+            btn.disabled = false;
+            addDebug('Tracking started successfully');
+          },
+          function(error) {
+            addDebug('Initial position error: ' + error.code + ' - ' + error.message);
+            
+            // Try again with even more permissive settings
+            if (error.code === 3) { // TIMEOUT
+              addDebug('Timeout - trying with low accuracy...');
+              navigator.geolocation.getCurrentPosition(
+                function(position) {
+                  addDebug('Got low-accuracy position: ' + position.coords.latitude + ', ' + position.coords.longitude);
+                  updateUserMarker(
+                    position.coords.longitude, 
+                    position.coords.latitude,
+                    position.coords.accuracy
+                  );
+                  isTracking = true;
+                  btn.textContent = 'Stop Tracking';
+                  btn.disabled = false;
+                },
+                function(error2) {
+                  addDebug('Second attempt failed: ' + error2.code + ' - ' + error2.message);
+                  handleGeolocationError(error2);
+                  btn.disabled = false;
+                },
+                {
+                  enableHighAccuracy: false,
+                  maximumAge: 600000, // Accept 10-minute old positions
+                  timeout: 60000      // 1 minute timeout
+                }
+              );
+            } else {
+              handleGeolocationError(error);
+              btn.disabled = false;
+            }
+          },
+          {
+            enableHighAccuracy: true,
+            maximumAge: 10000,    // Accept 10-second old positions
+            timeout: 20000        // 20 seconds timeout
+          }
+        );
+      }
+    }
+
+    // handle geolocation errors
+    function handleGeolocationError(error) {
+      let message = 'Location error: ';
+      let debugMsg = 'Error code: ' + error.code;
+      
+      switch(error.code) {
+        case 1: // PERMISSION_DENIED
+          message += 'Location access denied by user. Please allow location access in your browser settings.';
+          debugMsg += ' (PERMISSION_DENIED)';
+          break;
+        case 2: // POSITION_UNAVAILABLE
+          message += 'Location information unavailable. Please check your GPS/network connection.';
+          debugMsg += ' (POSITION_UNAVAILABLE)';
+          break;
+        case 3: // TIMEOUT
+          message += 'Location request timed out. Please try again.';
+          debugMsg += ' (TIMEOUT)';
+          break;
+        default:
+          message += 'An unknown error occurred: ' + error.message;
+          debugMsg += ' (UNKNOWN)';
+          break;
+      }
+      
+      updateStatus(message, 'error');
+      addDebug(debugMsg + ' - ' + error.message);
+      console.error('Geolocation error:', error);
+    }
+
+    // Check if page is served over HTTPS or localhost
+    function checkSecureContext() {
+      const isSecure = location.protocol === 'https:' || 
+                      location.hostname === 'localhost' || 
+                      location.hostname === '127.0.0.1' ||
+                      location.hostname === '::1';
+      
+      addDebug('Protocol: ' + location.protocol + ', Host: ' + location.hostname + ', Secure: ' + isSecure);
+      
+      if (!isSecure) {
+        updateStatus('⚠️ For location access, please serve this page over HTTPS or localhost', 'warning');
+        addDebug('Insecure context detected');
+      } else {
+        addDebug('Secure context confirmed');
+      }
+    }
+
+    // Setup event listeners
+    function setupEventListeners() {
+      const centerBtn = document.getElementById('centerBtn');
+      const clearBtn = document.getElementById('clearBtn');
+      const requestBtn = document.getElementById('requestLocationBtn');
+      const testBtn = document.getElementById('testLocationBtn');
+      const modeSelect = document.getElementById('mode');
+
+      if (centerBtn) centerBtn.onclick = centerOnUser;
+      if (clearBtn) clearBtn.onclick = clearRoute;
+      if (requestBtn) requestBtn.onclick = toggleLocationTracking;
+      if (testBtn) testBtn.onclick = testLocation;
+      
+      // Update route when transport mode changes
+      if (modeSelect) {
+        modeSelect.onchange = function() {
+          if (currentUserLonLat && destFeature) {
+            const destCoords = ol.proj.toLonLat(destFeature.getGeometry().getCoordinates());
+            drawRoute(currentUserLonLat, destCoords);
+          }
+        };
+      }
+    }
+
+    // Initialize everything
+    function init() {
+      if (checkOLLoaded()) {
+        createMap();
+        checkSecureContext();
+        setupEventListeners();
+      } else {
+        updateStatus('Loading map library...', 'info');
+        setTimeout(init, 500); // Retry after 500ms
+      }
+    }
+
+    // Start when page loads
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', init);
+    } else {
+      init();
+    }
+
+  })();
+  </script>
+</body>
+</html>
